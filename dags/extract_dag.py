@@ -1,27 +1,11 @@
+import logging
 from datetime import datetime
-import os
+
 from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.models import Variable
-from smart_file_sensor import SmartFileSensor
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.providers.docker.operators.docker import DockerOperator
 
 
-def start_processing(dag_id, table_name):
-    print(f"{dag_id} start processing tables in database: {table_name}")
-
-
-def get_time(context):
-    ti = context['task_instance']
-    start_time = context['execution_date']
-    print("start time:", start_time)
-    ti.xcom_push(key='start_time', value=start_time.isoformat())
-
-
-config = {
-    'extract_dag': {'schedule_interval': "@daily", "start_date": datetime(2024, 6, 29)},
-    #'extract_user_purchases_dag': {'schedule_interval': "@daily", "start_date": datetime(2024, 6, 29), 'table_name': "user_purchase"}
-}
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
@@ -29,44 +13,119 @@ default_args = {
     'email_on_retry': False
 }
 
-for conf_name, conf in config.items():
-    with DAG(dag_id=conf_name,
-             default_args=default_args,
-             schedule_interval=conf['schedule_interval'],
-             start_date=conf['start_date'],
-             catchup=False) as dag:
-        app_path = Variable.get('last_mobile_path') # idea is to set the path to file_name_number+1 and for it
-        user_path = Variable.get('last_user_number') # idea is to set the path to file_name_number+1 and for it
 
-        wait_for_app_file_task = SmartFileSensor(
-            task_id='sensor_wait_app_file',
-            filepath=app_path+'.csv.gz',
-            fs_conn_id='fs_default',
-            queue='jobs_dag'
-        )
-        wait_for_user_file_task = SmartFileSensor(
-            task_id='sensor_wait_user_file',
-            filepath=user_path+'.csv.gz',
-            fs_conn_id='fs_default',
-            queue='jobs_dag'
-        )
-
-        trigger_app_task = TriggerDagRunOperator(
-            task_id='trigger_app_task',
-            trigger_dag_id='insert_rows',
-            on_success_callback=get_time,
-            poke_interval=60,
-            queue='jobs_dag'
-        )
-        trigger_user_task = TriggerDagRunOperator(
-            task_id='trigger_user_task',
-            trigger_dag_id='insert_rows',
-            on_success_callback=get_time,
-            poke_interval=60,
-            queue='jobs_dag'
-        )
-
-        wait_for_user_file_task >> trigger_user_task
-        wait_for_app_file_task >> trigger_app_task
+def get_time(_,**kwargs):
+    ti = kwargs['ti']
+    time = ti.xcom_pull(dag_id='sensor_dag', key='start_time', include_prior_dates=True)
+    logging.info(f"Retrieved start_time from XCom: {time}")
+    return datetime.fromisoformat(time) if time else None
 
 
+with DAG(
+        dag_id='extract_user_data_dag',
+        default_args=default_args,
+        schedule_interval='@daily',
+        start_date=datetime(2024, 6, 29),
+        catchup=False
+) as dag_1:
+
+    dag_sensor_user_task = ExternalTaskSensor(
+        task_id='insert_user_rows',
+        external_dag_id='sensor_dag',
+        external_task_id='trigger_user_task',
+        execution_date_fn=get_time,
+        mode='poke',
+        queue='jobs_dag',
+        allowed_states=['success'],
+        failed_states=['failed', 'skipped'],
+        poke_interval=60,
+        timeout=600
+    )
+
+    create_spark_container_1 = DockerOperator(
+        task_id='create_spark_container_1',
+        image='apache/spark:latest',
+        container_name='spark-container-1',
+        command='''
+        /opt/spark/bin/spark-submit /spark-scripts/query_user_script.py
+        ''',
+        auto_remove=True,
+        mounts=[
+            {
+                'source': '/Users/broczniok/Desktop/etl-practice/spark-scripts',
+                'target': '/spark-scripts',
+                'type': 'bind'
+            },
+            {
+                'source': '/Users/broczniok/Desktop/etl-practice/parquets',
+                'target': '/opt/spark/parquets',
+                'type': 'bind'
+            },
+            {
+                'source': '/Users/broczniok/Desktop/etl-practice/capstone-dataset',
+                'target': '/capstone-dataset',
+                'type': 'bind'
+            }
+        ],
+        docker_url='unix://var/run/docker.sock',
+        network_mode='bridge',
+        tty=True,
+        dag=dag_1,
+        queue='jobs_dag'
+    )
+
+    dag_sensor_user_task >> create_spark_container_1
+
+with DAG(
+        dag_id='extract_app_data_dag',
+        default_args=default_args,
+        schedule_interval='@daily',
+        start_date=datetime(2024, 6, 29),
+        catchup=False
+) as dag_2:
+    dag_sensor_app_task = ExternalTaskSensor(
+        task_id='insert_app_rows',
+        external_dag_id='sensor_dag',
+        external_task_id='trigger_app_task',
+        execution_date_fn=get_time,
+        mode='poke',
+        queue='jobs_dag',
+        allowed_states=['success'],
+        failed_states=['failed', 'skipped'],
+        poke_interval=60,
+        timeout=600
+    )
+
+    create_spark_container_2 = DockerOperator(
+        task_id='create_spark_container_2',
+        image='apache/spark:latest',
+        container_name='spark-container-2',
+        command='''
+        /opt/spark/bin/spark-submit /spark-scripts/query_app_script.py
+        ''',
+        auto_remove=True,
+        mounts=[
+            {
+                'source': '/Users/broczniok/Desktop/etl-practice/spark-scripts',
+                'target': '/spark-scripts',
+                'type': 'bind'
+            },
+            {
+                'source': '/Users/broczniok/Desktop/etl-practice/parquets',
+                'target': '/opt/spark/parquets',
+                'type': 'bind'
+            },
+            {
+                'source': '/Users/broczniok/Desktop/etl-practice/capstone-dataset',
+                'target': '/capstone-dataset',
+                'type': 'bind'
+            }
+        ],
+        docker_url='unix://var/run/docker.sock',
+        network_mode='bridge',
+        tty=True,
+        dag=dag_2,
+        queue='jobs_dag'
+    )
+
+    dag_sensor_app_task >> create_spark_container_2
